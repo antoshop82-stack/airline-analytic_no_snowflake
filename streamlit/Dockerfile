@@ -2,7 +2,8 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir streamlit snowflake-connector-python pandas python-dotenv plotly
+# Rimosso snowflake-connector-python e aggiunto psycopg2-binary
+RUN pip install --no-cache-dir streamlit psycopg2-binary pandas python-dotenv plotly
 
 COPY . .
 

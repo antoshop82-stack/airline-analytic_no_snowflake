@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r /requirements.txt
 # Passa a root per creare l'ambiente virtuale di dbt e impostare i permessi
 USER root
 RUN python3 -m venv /opt/dbt-venv && \
-    /opt/dbt-venv/bin/pip install --no-cache-dir dbt-snowflake==1.9.0 && \
+    /opt/dbt-venv/bin/pip install --no-cache-dir dbt-postgres==1.7.15 && \
     chown -R airflow:root /opt/dbt-venv
 
 # Torna all'utente Airflow per la sicurezza

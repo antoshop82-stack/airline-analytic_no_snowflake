@@ -1,17 +1,20 @@
 import os
 import logging
 from datetime import datetime, timezone
+import psycopg2
+from psycopg2.extras import execute_batch
+from dotenv import load_dotenv
 
-import snowflake.connector
-
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS RAW_FLIGHTS (
+CREATE SCHEMA IF NOT EXISTS RAW;
+CREATE TABLE IF NOT EXISTS RAW.RAW_FLIGHTS (
     icao24 VARCHAR,
-    first_seen TIMESTAMP_NTZ,
+    first_seen TIMESTAMP,
     est_departure_airport VARCHAR,
-    last_seen TIMESTAMP_NTZ,
+    last_seen TIMESTAMP,
     est_arrival_airport VARCHAR,
     callsign VARCHAR,
     est_departure_airport_horiz_distance INT,
@@ -22,12 +25,12 @@ CREATE TABLE IF NOT EXISTS RAW_FLIGHTS (
     arrival_airport_candidates_count INT,
     flight_direction VARCHAR,
     queried_airport VARCHAR,
-    ingested_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
 
 INSERT_SQL = """
-INSERT INTO RAW_FLIGHTS (
+INSERT INTO RAW.RAW_FLIGHTS (
     icao24, first_seen, est_departure_airport, last_seen,
     est_arrival_airport, callsign,
     est_departure_airport_horiz_distance, est_departure_airport_vert_distance,
@@ -44,39 +47,32 @@ INSERT INTO RAW_FLIGHTS (
 );
 """
 
-
-def get_snowflake_connection():
-    """Create a Snowflake connection using environment variables."""
-    return snowflake.connector.connect(
-        account=os.environ["SNOWFLAKE_ACCOUNT"],
-        user=os.environ["SNOWFLAKE_USER"],
-        password=os.environ["SNOWFLAKE_PASSWORD"],
-        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
-        database=os.environ["SNOWFLAKE_DATABASE"],
-        schema=os.environ["SNOWFLAKE_SCHEMA"],
+def get_postgres_connection():
+    """Create a PostgreSQL connection using environment variables."""
+    return psycopg2.connect(
+        host=os.environ["POSTGRES_HOST"],
+        port=os.environ.get("POSTGRES_PORT", 5432),
+        database=os.environ["POSTGRES_DB"],
+        user=os.environ["POSTGRES_USER"],
+        password=os.environ["POSTGRES_PASSWORD"],
     )
 
-
 def create_raw_table_if_not_exists(conn):
-    """Ensure the RAW_FLIGHTS table exists in Snowflake."""
+    """Ensure the RAW_FLIGHTS table exists in PostgreSQL."""
     with conn.cursor() as cursor:
         cursor.execute(CREATE_TABLE_SQL)
+    conn.commit()
     logger.info("RAW_FLIGHTS table ready.")
 
-
 def _unix_to_timestamp(ts):
-    """Convert a Unix timestamp (seconds) to a datetime, or None."""
+    """Convert a Unix timestamp (seconds) to a datetime string, or None."""
     if ts is None:
         return None
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-
 def load_flights(conn, flights):
     """
-    Insert a list of flight dicts into Snowflake RAW_FLIGHTS.
-
-    Each dict should have the keys returned by the OpenSky API plus
-    'flight_direction' and 'queried_airport' added by the client.
+    Insert a list of flight dicts into PostgreSQL RAW.RAW_FLIGHTS.
     """
     if not flights:
         logger.info("No flights to load.")
@@ -118,8 +114,8 @@ def load_flights(conn, flights):
         )
 
     with conn.cursor() as cursor:
-        cursor.executemany(INSERT_SQL, rows)
+        execute_batch(cursor, INSERT_SQL, rows, page_size=500)
     
     conn.commit()
-    logger.info("Loaded %d flight records into Snowflake.", len(rows))
+    logger.info("Loaded %d flight records into PostgreSQL.", len(rows))
     return len(rows)

@@ -3,7 +3,7 @@ OpenSky Flights DAG
 -------------------
 Daily pipeline that extracts flight arrivals and departures from the
 OpenSky Network API for a set of global airports, then loads the raw
-data into Snowflake for downstream dbt modelling.
+data into PostgreSQL for downstream dbt modelling.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -19,13 +19,13 @@ default_args = {
 
 
 @dag(
-    dag_id="opensky_flights_to_snowflake",
+    dag_id="opensky_flights_to_postgres",
     default_args=default_args,
-    description="Extract OpenSky flight data and load into Snowflake",
+    description="Extract OpenSky flight data and load into PostgreSQL",
     schedule="@daily",
     start_date=datetime(2025, 3, 15),
     catchup=False,
-    tags=["opensky", "snowflake", "raw"],
+    tags=["opensky", "postgres", "raw"],
 )
 def opensky_flights_dag():
 
@@ -51,17 +51,17 @@ def opensky_flights_dag():
         return flights
 
     @task()
-    def load_to_snowflake(flights):
-        """Load extracted flight data into Snowflake RAW_FLIGHTS table."""
+    def load_to_postgres(flights):
+        """Load extracted flight data into PostgreSQL RAW_FLIGHTS table."""
         import sys, os
         sys.path.insert(0, os.path.join(os.environ.get("AIRFLOW_HOME", "/opt/airflow"), "include"))
-        from snowflake_loader import (
-            get_snowflake_connection,
+        from postgres_loader import (
+            get_postgres_connection,
             create_raw_table_if_not_exists,
             load_flights,
         )
 
-        conn = get_snowflake_connection()
+        conn = get_postgres_connection()
         try:
             create_raw_table_if_not_exists(conn)
             count = load_flights(conn, flights)
@@ -74,11 +74,11 @@ def opensky_flights_dag():
         """Log a summary of the ingestion run."""
         import logging
         logger = logging.getLogger(__name__)
-        logger.info("Pipeline complete — %d flight records ingested into Snowflake.", count)
+        logger.info("Pipeline complete — %d flight records ingested into PostgreSQL.", count)
 
     # ── Task dependencies ───────────────────────────────────────────
     flights = extract_flights()
-    count = load_to_snowflake(flights)
+    count = load_to_postgres(flights)
     log_summary(count)
 
 

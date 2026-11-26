@@ -1,541 +1,680 @@
 """
 Airport Operations Intelligence Dashboard
-==========================================
-Stakeholder: Airport Operations Director
-Purpose: Capacity planning, peak management, airline risk, and peer benchmarking.
-Powered by the BACKFILL schema (7-day clean dataset).
+========================================
+Reads the Gold models produced by dbt in PostgreSQL.
 
-Run with:  streamlit run backfill_dashboard.py
+Run locally:
+    streamlit run streamlit/backfill_dashboard.py
+
+Run in Docker:
+    docker compose up -d streamlit
 """
 
 import os
+from pathlib import Path
+
 import pandas as pd
-import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-import snowflake.connector
+import psycopg2
 import streamlit as st
+from dotenv import load_dotenv
 
-# ── LETTURA MANUALE DEL FILE .ENV (FORZATA) ──────────────────────────
-def force_load_env():
-    # Trova il file .env risalendo di una cartella rispetto a dove si trova lo script
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    env_path = os.path.join(base_dir, "..", ".env")
-    
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                # Pulisce la riga ed esclude i commenti o le righe vuote
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                # Separa chiave e valore alla prima occorrenza di "="
-                key, val = line.split("=", 1)
-                # Rimuove eventuali virgolette o spazi superflui attorno ai valori
-                os.environ[key.strip()] = val.strip().strip('"').strip("'")
-    else:
-        st.error(f"⚠️ Impossibile trovare il file .env nel percorso previsto: {env_path}")
 
-# Esegui la lettura forzata prima di richiamare le query
-force_load_env()
-# ─────────────────────────────────────────────────────────────────────
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=False)
 
-# ── Page config ───────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Airport Operations Intelligence",
-    page_icon="🛫",
     layout="wide",
 )
 
 TEMPLATE = "plotly_white"
 
-# ── Snowflake connection ──────────────────────────────────────────────
-@st.cache_resource
+Q_AIRPORT_SUMMARY = """
+SELECT
+    airport_icao,
+    city,
+    SUM(total_arrivals) AS arrivals,
+    SUM(total_departures) AS departures,
+    SUM(total_movements) AS total_movements,
+    ROUND(AVG(total_movements), 0) AS avg_daily,
+    MIN(flight_date) AS data_from,
+    MAX(flight_date) AS data_to,
+    COUNT(DISTINCT flight_date) AS days
+FROM "GOLD".gld_daily_airport_traffic
+GROUP BY airport_icao, city
+ORDER BY total_movements DESC, airport_icao
+"""
+
+Q_DAILY_TREND = """
+SELECT
+    flight_date,
+    airport_icao,
+    city,
+    total_arrivals,
+    total_departures,
+    total_movements
+FROM "GOLD".gld_daily_airport_traffic
+ORDER BY flight_date, airport_icao
+"""
+
+Q_HOURLY = """
+SELECT
+    airport_icao,
+    city,
+    departure_hour_local,
+    SUM(flight_count) AS flights
+FROM "GOLD".gld_hourly_flight_activity
+GROUP BY airport_icao, city, departure_hour_local
+ORDER BY airport_icao, departure_hour_local
+"""
+
+Q_AIRLINE_BY_AIRPORT = """
+SELECT
+    airport_icao,
+    city,
+    airline_name,
+    alliance,
+    SUM(total_flights) AS flights
+FROM "GOLD".gld_airline_traffic
+GROUP BY airport_icao, city, airline_name, alliance
+ORDER BY airport_icao, flights DESC
+"""
+
+Q_ROUTES = """
+SELECT
+    departure_airport_icao,
+    arrival_airport_icao,
+    departure_city,
+    arrival_city,
+    total_flights,
+    ROUND(avg_duration_min::numeric, 0) AS avg_duration_min,
+    unique_aircraft,
+    days_with_service
+FROM "GOLD".gld_route_analysis
+ORDER BY total_flights DESC, departure_airport_icao, arrival_airport_icao
+"""
+
+
 def get_connection():
-    return snowflake.connector.connect(
-        account=os.environ["SNOWFLAKE_ACCOUNT"],
-        user=os.environ["SNOWFLAKE_USER"],
-        password=os.environ["SNOWFLAKE_PASSWORD"],
-        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
-        database=os.environ["SNOWFLAKE_DATABASE"],
-        schema="BACKFILL",
-        role=os.environ.get("SNOWFLAKE_ROLE", "ACCOUNTADMIN"),
-        login_timeout=120,
-        network_timeout=120,
+    return psycopg2.connect(
+        host=os.getenv("POSTGRES_HOST", "postgres"),
+        port=int(os.getenv("POSTGRES_PORT", "5432")),
+        user=os.getenv("POSTGRES_USER", "airflow"),
+        password=os.getenv("POSTGRES_PASSWORD", "airflow"),
+        database=os.getenv("POSTGRES_DB", "airflow"),
+        connect_timeout=10,
+        application_name="airport_streamlit_dashboard",
     )
 
 
 @st.cache_data(ttl=300)
 def run_query(sql: str) -> pd.DataFrame:
     conn = get_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(sql)
-        columns = [desc[0].lower() for desc in cur.description]
-        data = cur.fetchall()
-        return pd.DataFrame(data, columns=columns)
+        with conn.cursor() as cursor:
+            cursor.execute(sql)
+            columns = [column[0].lower() for column in cursor.description]
+            rows = cursor.fetchall()
+
+        return pd.DataFrame(rows, columns=columns)
     finally:
-        cur.close()
+        conn.close()
 
 
-# ── Queries ───────────────────────────────────────────────────────────
+def prepare_numeric(df, columns):
+    result = df.copy()
+    for column in columns:
+        result[column] = pd.to_numeric(result[column], errors="coerce")
+    return result
 
-Q_AIRPORT_SUMMARY = """
-SELECT airport_icao, city,
-       SUM(total_arrivals) AS arrivals,
-       SUM(total_departures) AS departures,
-       SUM(total_movements) AS total_movements,
-       ROUND(AVG(total_movements), 0) AS avg_daily,
-       MIN(flight_date) AS data_from,
-       MAX(flight_date) AS data_to,
-       COUNT(DISTINCT flight_date) AS days
-FROM gld_daily_airport_traffic
-GROUP BY 1, 2
-ORDER BY total_movements DESC
-"""
 
-Q_DAILY_TREND = """
-SELECT flight_date, airport_icao, city,
-       total_arrivals, total_departures, total_movements
-FROM gld_daily_airport_traffic
-ORDER BY flight_date, airport_icao
-"""
+def hour_label(value):
+    if pd.isna(value):
+        return "Unknown"
 
-Q_HOURLY = """
-SELECT airport_icao, city, departure_hour_local,
-       SUM(flight_count) AS flights
-FROM gld_hourly_flight_activity
-GROUP BY 1, 2, 3
-ORDER BY 1, 3
-"""
+    total_minutes = round(float(value) * 60) % (24 * 60)
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours:02d}:{minutes:02d}"
 
-Q_AIRLINE_BY_AIRPORT = """
-SELECT airport_icao, city, airline_name, alliance,
-       SUM(total_flights) AS flights
-FROM gld_airline_traffic
-WHERE airline_name IS NOT NULL
-GROUP BY 1, 2, 3, 4
-ORDER BY airport_icao, flights DESC
-"""
 
-Q_TOP_ROUTES_BY_AIRPORT = """
-SELECT departure_airport_icao, arrival_airport_icao,
-       departure_city, arrival_city,
-       total_flights,
-       ROUND(avg_duration_min, 0) AS avg_duration_min,
-       unique_aircraft,
-       days_with_service
-FROM gld_route_analysis
-ORDER BY total_flights DESC
-"""
-
-# ── Load all data ─────────────────────────────────────────────────────
-airport_df = run_query(Q_AIRPORT_SUMMARY)
-daily_df = run_query(Q_DAILY_TREND)
-hourly_df = run_query(Q_HOURLY)
-airline_df = run_query(Q_AIRLINE_BY_AIRPORT)
-routes_df = run_query(Q_TOP_ROUTES_BY_AIRPORT)
-
-# ── Header ────────────────────────────────────────────────────────────
 st.title("Airport Operations Intelligence")
-st.caption(
-    f"Reporting period: {airport_df['data_from'].iloc[0]} to {airport_df['data_to'].iloc[0]} "
-    f"| {int(airport_df['days'].iloc[0])} days | Source: OpenSky Network"
+
+with st.sidebar:
+    st.header("Data controls")
+    st.caption('Source: PostgreSQL schema "GOLD"')
+
+    if st.button("Refresh data", use_container_width=True):
+        run_query.clear()
+
+    st.caption("Query results are cached for up to 5 minutes.")
+
+try:
+    airport_df = run_query(Q_AIRPORT_SUMMARY)
+    daily_df = run_query(Q_DAILY_TREND)
+    hourly_df = run_query(Q_HOURLY)
+    airline_df = run_query(Q_AIRLINE_BY_AIRPORT)
+    routes_df = run_query(Q_ROUTES)
+except Exception as exc:
+    st.error(
+        "Unable to read the Gold models. "
+        "Check the database configuration and the dbt execution."
+    )
+    with st.expander("Technical details"):
+        st.code(str(exc), language="text")
+    st.stop()
+
+if airport_df.empty:
+    st.warning(
+        "No airport data is available in the Gold models. "
+        "Check OpenSky ingestion and run the dbt models."
+    )
+    st.stop()
+
+airport_df = prepare_numeric(
+    airport_df,
+    ["arrivals", "departures", "total_movements", "avg_daily", "days"],
+)
+daily_df = prepare_numeric(
+    daily_df,
+    ["total_arrivals", "total_departures", "total_movements"],
+)
+hourly_df = prepare_numeric(
+    hourly_df,
+    ["departure_hour_local", "flights"],
+)
+airline_df = prepare_numeric(airline_df, ["flights"])
+routes_df = prepare_numeric(
+    routes_df,
+    [
+        "total_flights",
+        "avg_duration_min",
+        "unique_aircraft",
+        "days_with_service",
+    ],
 )
 
-# ── Airport selector ──────────────────────────────────────────────────
+daily_df["flight_date"] = pd.to_datetime(daily_df["flight_date"])
+
 airport_options = airport_df["airport_icao"].tolist()
 city_map = dict(zip(airport_df["airport_icao"], airport_df["city"]))
 
 selected = st.selectbox(
     "Select your airport",
     options=airport_options,
-    format_func=lambda x: f"{x} — {city_map[x]}",
+    format_func=lambda code: (
+        f"{code} - {city_map.get(code) or 'Unknown city'}"
+    ),
 )
 
-my = airport_df[airport_df["airport_icao"] == selected].iloc[0]
-peers = airport_df[airport_df["airport_icao"] != selected]
+my = airport_df.loc[airport_df["airport_icao"] == selected].iloc[0]
+my_daily = daily_df.loc[
+    daily_df["airport_icao"] == selected
+].sort_values("flight_date").copy()
+
+st.caption(
+    f"Selected airport reporting period: {my['data_from']} to {my['data_to']} "
+    f"| {int(my['days'])} dates with data | Source: OpenSky Network"
+)
+
+st.info(
+    "These indicators describe the observations available in this dataset. "
+    "They are not a complete measure of airport capacity, congestion, "
+    "passenger traffic or airline market share."
+)
 
 st.divider()
 
-# =====================================================================
-# SECTION 1: CAPACITY OVERVIEW
-# =====================================================================
-st.header("1 — Capacity Overview")
+# ---------------------------------------------------------------------
+# 1. Observed traffic
+# ---------------------------------------------------------------------
+st.header("1 - Observed Traffic Overview")
 
-# KPIs for selected airport
 k1, k2, k3, k4, k5 = st.columns(5)
+
 k1.metric("Total Movements", f"{int(my['total_movements']):,}")
-k2.metric("Avg Daily", int(my["avg_daily"]))
+k2.metric("Avg per Recorded Date", f"{float(my['avg_daily']):,.0f}")
 k3.metric("Arrivals", f"{int(my['arrivals']):,}")
 k4.metric("Departures", f"{int(my['departures']):,}")
 
-# Arrival/departure imbalance
 imbalance = int(my["departures"]) - int(my["arrivals"])
-imbalance_pct = round(imbalance * 100 / my["total_movements"], 1) if my["total_movements"] > 0 else 0
+total_movements = float(my["total_movements"])
+imbalance_pct = (
+    imbalance / total_movements * 100
+    if total_movements > 0
+    else 0
+)
+
 k5.metric(
     "Arr/Dep Imbalance",
     f"{imbalance_pct:+.1f}%",
-    delta=f"{imbalance:+d} flights",
+    delta=f"{imbalance:+,} movements",
     delta_color="off",
 )
 
-# Recommendation
-if abs(imbalance_pct) > 3:
-    direction = "departures" if imbalance > 0 else "arrivals"
-    st.info(
-        f"**Operational note:** {city_map[selected]} shows a {abs(imbalance_pct)}% skew toward "
-        f"{direction}. This may indicate aircraft repositioning pressure — review gate "
-        f"allocation and turnaround scheduling."
-    )
-else:
-    st.success(
-        f"**Balanced operations:** {city_map[selected]} arrivals and departures are well balanced "
-        f"({abs(imbalance_pct)}% variance). No gate reallocation needed."
-    )
+st.caption(
+    "An imbalance describes the available records; it does not by itself "
+    "demonstrate aircraft repositioning or a need to change gate allocation. "
+    "The daily average includes only dates present in the model."
+)
 
 st.divider()
 
-# =====================================================================
-# SECTION 2: DAILY VOLUME TREND + PEER BENCHMARK
-# =====================================================================
-st.header("2 — Daily Volume Trend & Peer Benchmark")
+# ---------------------------------------------------------------------
+# 2. Daily trends and comparison
+# ---------------------------------------------------------------------
+st.header("2 - Daily Volume Trend & Peer Comparison")
+
+peer_avg = (
+    daily_df.loc[daily_df["airport_icao"] != selected]
+    .groupby("flight_date", as_index=False)["total_movements"]
+    .mean()
+)
 
 col_trend, col_bench = st.columns([3, 2])
 
 with col_trend:
-    my_daily = daily_df[daily_df["airport_icao"] == selected].copy()
-
     fig_trend = go.Figure()
-    fig_trend.add_trace(go.Scatter(
-        x=my_daily["flight_date"], y=my_daily["total_movements"],
-        name=city_map[selected], mode="lines+markers",
-        line=dict(color="#636EFA", width=3),
-    ))
-    # Add peer average as reference
-    peer_avg = daily_df[daily_df["airport_icao"] != selected].groupby("flight_date")["total_movements"].mean().reset_index()
-    fig_trend.add_trace(go.Scatter(
-        x=peer_avg["flight_date"], y=peer_avg["total_movements"],
-        name="Peer Average", mode="lines",
-        line=dict(color="#CCCCCC", dash="dash", width=2),
-    ))
+
+    fig_trend.add_trace(
+        go.Scatter(
+            x=my_daily["flight_date"],
+            y=my_daily["total_movements"],
+            name=selected,
+            mode="lines+markers",
+            line=dict(color="#636EFA", width=3),
+        )
+    )
+
+    if not peer_avg.empty:
+        fig_trend.add_trace(
+            go.Scatter(
+                x=peer_avg["flight_date"],
+                y=peer_avg["total_movements"],
+                name="Available Peer Average",
+                mode="lines",
+                line=dict(color="#AAAAAA", dash="dash", width=2),
+            )
+        )
+
     fig_trend.update_layout(
         template=TEMPLATE,
-        xaxis_title="", yaxis_title="Daily Movements",
-        legend=dict(orientation="h", y=-0.2),
-        height=350, margin=dict(t=10),
+        xaxis_title="Date (UTC)",
+        yaxis_title="Observed Daily Movements",
+        legend=dict(orientation="h", y=-0.25),
+        height=350,
+        margin=dict(t=10),
     )
     st.plotly_chart(fig_trend, use_container_width=True)
 
 with col_bench:
-    # Peer ranking bar
-    all_airports = airport_df[["city", "avg_daily"]].copy()
-    all_airports["is_selected"] = all_airports["city"] == city_map[selected]
-    all_airports = all_airports.sort_values("avg_daily", ascending=True)
+    ranking = airport_df[
+        ["airport_icao", "city", "avg_daily"]
+    ].sort_values("avg_daily").copy()
 
-    colors = ["#636EFA" if s else "#D3D3D3" for s in all_airports["is_selected"]]
+    ranking["label"] = (
+        ranking["airport_icao"]
+        + " - "
+        + ranking["city"].fillna("Unknown city")
+    )
 
-    fig_rank = go.Figure(go.Bar(
-        x=all_airports["avg_daily"],
-        y=all_airports["city"],
-        orientation="h",
-        marker_color=colors,
-    ))
+    colors = [
+        "#636EFA" if code == selected else "#D3D3D3"
+        for code in ranking["airport_icao"]
+    ]
+
+    fig_rank = go.Figure(
+        go.Bar(
+            x=ranking["avg_daily"],
+            y=ranking["label"],
+            orientation="h",
+            marker_color=colors,
+        )
+    )
+
     fig_rank.update_layout(
         template=TEMPLATE,
-        xaxis_title="Avg Daily Movements",
+        xaxis_title="Avg Movements per Recorded Date",
         yaxis_title="",
-        height=350, margin=dict(t=10),
+        height=350,
+        margin=dict(t=10),
     )
     st.plotly_chart(fig_rank, use_container_width=True)
 
-# Trend recommendation
-my_volumes = my_daily["total_movements"].tolist()
-if len(my_volumes) >= 3:
-    recent_avg = np.mean(my_volumes[-3:])
-    earlier_avg = np.mean(my_volumes[:3])
-    trend_pct = round((recent_avg - earlier_avg) / earlier_avg * 100, 1) if earlier_avg > 0 else 0
-    peer_daily_avg = int(peer_avg["total_movements"].mean())
+rank = int((airport_df["avg_daily"] > my["avg_daily"]).sum()) + 1
 
-    if trend_pct > 5:
-        st.warning(
-            f"**Capacity alert:** {city_map[selected]} shows a **{trend_pct:+.1f}% upward trend** "
-            f"over the period. If sustained, consider reviewing runway slot limits and "
-            f"staffing levels for the coming weeks."
-        )
-    elif trend_pct < -5:
-        st.info(
-            f"**Volume declining:** {city_map[selected]} traffic is trending **{trend_pct:+.1f}%**. "
-            f"Evaluate whether this is seasonal or structural. Review airline schedule "
-            f"commitments for the next period."
+st.caption(
+    f"Observed-volume rank: {rank} of {len(airport_df)} airports. "
+    "Coverage and recorded dates may differ between airports. "
+    "Missing dates are not automatically treated as zero traffic."
+)
+
+volumes = my_daily["total_movements"]
+
+if len(volumes) >= 6:
+    earlier_avg = volumes.iloc[:3].mean()
+    recent_avg = volumes.iloc[-3:].mean()
+
+    if earlier_avg > 0:
+        trend_pct = (recent_avg / earlier_avg - 1) * 100
+        st.caption(
+            f"Latest 3 recorded dates versus earliest 3 recorded dates: "
+            f"{trend_pct:+.1f}% observed movements."
         )
 
-    rank = int((airport_df["avg_daily"] >= my["avg_daily"]).sum())
+st.divider()
+
+# ---------------------------------------------------------------------
+# 3. Hourly profile
+# ---------------------------------------------------------------------
+st.header("3 - Hourly Observation Profile")
+
+st.warning(
+    "Model limitation: the current hourly model uses departure timestamps "
+    "for both arrival and departure observations and applies a fixed UTC "
+    "offset. This is not yet a validated local-time airport movement profile."
+)
+
+my_hourly = hourly_df.loc[
+    hourly_df["airport_icao"] == selected
+].copy()
+
+unknown_hour_count = int(
+    my_hourly.loc[
+        my_hourly["departure_hour_local"].isna(), "flights"
+    ].sum()
+)
+
+my_hourly = my_hourly.dropna(
+    subset=["departure_hour_local", "flights"]
+).sort_values("departure_hour_local")
+
+if my_hourly.empty:
+    st.info("No hourly observations with a known local-hour value.")
+else:
+    peak = my_hourly.loc[my_hourly["flights"].idxmax()]
+    hourly_total = my_hourly["flights"].sum()
+
+    fig_hourly = go.Figure(
+        go.Bar(
+            x=my_hourly["departure_hour_local"],
+            y=my_hourly["flights"],
+            marker_color="#636EFA",
+            customdata=[
+                hour_label(value)
+                for value in my_hourly["departure_hour_local"]
+            ],
+            hovertemplate=(
+                "Model hour: %{customdata}"
+                "<br>Observations: %{y:,}<extra></extra>"
+            ),
+        )
+    )
+
+    fig_hourly.update_layout(
+        template=TEMPLATE,
+        xaxis_title="Model Local-Hour Value",
+        yaxis_title="Observations over Selected Airport Reporting Period",
+        xaxis=dict(dtick=1),
+        height=350,
+        margin=dict(t=10),
+    )
+    st.plotly_chart(fig_hourly, use_container_width=True)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Peak Model Hour", hour_label(peak["departure_hour_local"]))
+    c2.metric("Peak Observations", f"{int(peak['flights']):,}")
+    c3.metric(
+        "Share of Known-Hour Observations",
+        f"{peak['flights'] / hourly_total * 100:.1f}%"
+        if hourly_total > 0
+        else "N/A",
+    )
+
+if unknown_hour_count:
     st.caption(
-        f"Peer benchmark: {city_map[selected]} ranks **#{rank}** of 6 airports "
-        f"with {int(my['avg_daily'])} avg daily movements vs peer average of {peer_daily_avg}."
+        f"{unknown_hour_count:,} observations have no local-hour value "
+        "and are excluded from the hourly chart."
     )
 
 st.divider()
 
-# =====================================================================
-# SECTION 3: PEAK HOUR ANALYSIS
-# =====================================================================
-st.header("3 — Peak Hour Congestion")
+# ---------------------------------------------------------------------
+# 4. Airline composition
+# ---------------------------------------------------------------------
+st.header("4 - Observed Airline Composition")
 
-my_hourly = hourly_df[hourly_df["airport_icao"] == selected].copy()
+all_airlines = airline_df.loc[
+    airline_df["airport_icao"] == selected
+].copy()
 
-if not my_hourly.empty:
-    peak_hour = my_hourly.loc[my_hourly["flights"].idxmax()]
-    total_flights = my_hourly["flights"].sum()
-    peak_flights = int(peak_hour["flights"])
-    peak_pct = round(peak_flights / total_flights * 100, 1)
+if all_airlines.empty:
+    st.info("No airline observations are available for this airport.")
+else:
+    observed_total = all_airlines["flights"].sum()
+    unknown_total = all_airlines.loc[
+        all_airlines["airline_name"].isna(), "flights"
+    ].sum()
 
-    col_heat, col_insight = st.columns([3, 2])
+    st.caption(
+        f"Records with an unmatched airline name: "
+        f"{int(unknown_total):,} of {int(observed_total):,} "
+        "airline-model observations. Records without a callsign prefix "
+        "are excluded upstream."
+    )
 
-    with col_heat:
-        fig_hourly = go.Figure()
+    matched = all_airlines.dropna(subset=["airline_name"])
 
-        # Bar chart for selected airport
-        fig_hourly.add_trace(go.Bar(
-            x=my_hourly["departure_hour_local"],
-            y=my_hourly["flights"],
-            marker_color=["#EF553B" if f >= peak_flights * 0.85 else "#636EFA"
-                          for f in my_hourly["flights"]],
-        ))
-        fig_hourly.update_layout(
-            template=TEMPLATE,
-            xaxis_title="Hour (Local Time)",
-            yaxis_title="Total Flights (7 days)",
-            xaxis=dict(dtick=1),
-            height=350, margin=dict(t=10),
-        )
-        st.plotly_chart(fig_hourly, use_container_width=True)
+    my_airlines = (
+        matched.groupby("airline_name", as_index=False)["flights"]
+        .sum()
+        .sort_values("flights", ascending=False)
+        .reset_index(drop=True)
+    )
 
-    with col_insight:
-        # Find quiet hours (below 30% of peak)
-        quiet_mask = my_hourly["flights"] < peak_flights * 0.3
-        quiet_hours = my_hourly[quiet_mask]["departure_hour_local"].tolist()
-        quiet_str = ", ".join(f"{int(h):02d}:00" for h in sorted(quiet_hours)) if quiet_hours else "None"
+    matched_total = my_airlines["flights"].sum()
 
-        # Find congested hours (above 85% of peak)
-        busy_mask = my_hourly["flights"] >= peak_flights * 0.85
-        busy_hours = my_hourly[busy_mask]["departure_hour_local"].tolist()
-        busy_str = ", ".join(f"{int(h):02d}:00" for h in sorted(busy_hours))
-
-        # Operating window
-        active = my_hourly[my_hourly["flights"] > peak_flights * 0.3]["departure_hour_local"]
-        if not active.empty:
-            window_start = f"{int(active.min()):02d}:00"
-            window_end = f"{int(active.max()):02d}:00"
-        else:
-            window_start, window_end = "N/A", "N/A"
-
-        st.markdown("**Peak Hour Analysis**")
-        st.markdown(f"""
-        | Metric | Value |
-        |---|---|
-        | Peak hour | **{int(peak_hour['departure_hour_local']):02d}:00 local** |
-        | Peak volume | {peak_flights} flights ({peak_pct}% of daily) |
-        | Operating window | {window_start} — {window_end} |
-        | Congested hours (>85% peak) | {busy_str} |
-        | Quiet hours (<30% peak) | {quiet_str} |
-        """)
-
-    # Recommendation
-    congested_count = len(busy_hours)
-    if congested_count >= 5:
-        st.warning(
-            f"**Congestion risk:** {city_map[selected]} has **{congested_count} hours at >85% of peak capacity**. "
-            f"Recommendation: introduce off-peak landing fee incentives to redistribute "
-            f"traffic from {busy_str} toward underutilized slots ({quiet_str})."
-        )
-    elif congested_count <= 2:
-        st.success(
-            f"**Well-distributed traffic:** Only {congested_count} congested hours. "
-            f"Current slot allocation is efficient."
-        )
-
-st.divider()
-
-# =====================================================================
-# SECTION 4: AIRLINE CONCENTRATION RISK
-# =====================================================================
-st.header("4 — Airline Concentration Risk")
-
-my_airlines = airline_df[airline_df["airport_icao"] == selected].copy()
-
-if not my_airlines.empty:
-    total = my_airlines["flights"].sum()
-    my_airlines["share_pct"] = round(my_airlines["flights"] / total * 100, 1)
-    top5 = my_airlines.head(5)
-    top1_share = top5["share_pct"].iloc[0]
-    top3_share = top5["share_pct"].head(3).sum()
-
-    col_pie, col_table = st.columns([2, 3])
-
-    with col_pie:
-        # Top 5 + Others
-        others = pd.DataFrame({
-            "airline_name": ["Others"],
-            "alliance": [""],
-            "flights": [total - top5["flights"].sum()],
-            "share_pct": [round(100 - top5["share_pct"].sum(), 1)],
-        })
-        pie_data = pd.concat([top5[["airline_name", "flights", "share_pct"]], others], ignore_index=True)
-
-        fig_pie = px.pie(
-            pie_data,
-            values="flights",
-            names="airline_name",
-            hole=0.4,
-            template=TEMPLATE,
-        )
-        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-        fig_pie.update_layout(
-            height=350, margin=dict(t=10, b=10),
-            showlegend=False,
-        )
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-    with col_table:
-        st.markdown("**Top Airlines at this Airport**")
-        display_airlines = top5[["airline_name", "alliance", "flights", "share_pct"]].rename(
-            columns={
-                "airline_name": "Airline",
-                "alliance": "Alliance",
-                "flights": "Flights",
-                "share_pct": "Market Share %",
-            }
-        )
-        st.dataframe(display_airlines, use_container_width=True, hide_index=True)
-
-        # HHI concentration index
-        hhi = int((my_airlines["share_pct"] ** 2).sum())
-        st.caption(f"HHI Concentration Index: **{hhi}** (>2500 = highly concentrated, <1500 = competitive)")
-
-    # Recommendation
-    if top1_share > 30:
-        st.error(
-            f"**High dependency risk:** {top5['airline_name'].iloc[0]} controls **{top1_share}%** "
-            f"of traffic at {city_map[selected]}. If this airline reduces service, the airport "
-            f"faces significant revenue and connectivity loss. "
-            f"Recommendation: actively pursue route development with alternative carriers."
-        )
-    elif top3_share > 70:
-        st.warning(
-            f"**Moderate concentration:** Top 3 airlines control **{top3_share:.0f}%** of traffic. "
-            f"Diversification through low-cost carrier incentives would reduce risk."
-        )
+    if my_airlines.empty or matched_total <= 0:
+        st.info("No matched airlines are available for the composition chart.")
     else:
-        st.success(
-            f"**Healthy diversification:** No single airline exceeds 30% share, "
-            f"and top 3 control {top3_share:.0f}%. Low dependency risk."
+        my_airlines["share_pct"] = (
+            my_airlines["flights"] / matched_total * 100
+        )
+
+        top5 = my_airlines.head(5).copy()
+        others_count = matched_total - top5["flights"].sum()
+        pie_data = top5[["airline_name", "flights"]].copy()
+
+        if others_count > 0:
+            pie_data = pd.concat(
+                [
+                    pie_data,
+                    pd.DataFrame(
+                        {
+                            "airline_name": ["Other Matched Airlines"],
+                            "flights": [others_count],
+                        }
+                    ),
+                ],
+                ignore_index=True,
+            )
+
+        col_pie, col_table = st.columns([2, 3])
+
+        with col_pie:
+            fig_pie = px.pie(
+                pie_data,
+                values="flights",
+                names="airline_name",
+                hole=0.4,
+                template=TEMPLATE,
+            )
+            fig_pie.update_traces(
+                textposition="inside",
+                textinfo="percent+label",
+            )
+            fig_pie.update_layout(
+                height=350,
+                margin=dict(t=10, b=10),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        with col_table:
+            display_airlines = top5.rename(
+                columns={
+                    "airline_name": "Airline",
+                    "flights": "Observed Records",
+                    "share_pct": "Share of Matched Records %",
+                }
+            )
+
+            st.dataframe(
+                display_airlines,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            hhi = (my_airlines["share_pct"] ** 2).sum()
+            st.metric("Observed Composition HHI", f"{hhi:,.0f}")
+
+        st.caption(
+            "Shares and HHI are calculated over matched airline-model "
+            "records only. They do not measure passenger, seat, revenue "
+            "or complete airport market shares."
         )
 
 st.divider()
 
-# =====================================================================
-# SECTION 5: ROUTE CONNECTIVITY
-# =====================================================================
-st.header("5 — Route Connectivity")
+# ---------------------------------------------------------------------
+# 5. Routes
+# ---------------------------------------------------------------------
+st.header("5 - Observed Route Connectivity")
 
-my_routes = routes_df[
-    (routes_df["departure_airport_icao"] == selected) |
-    (routes_df["arrival_airport_icao"] == selected)
-].head(10).copy()
+st.caption(
+    "Current route counts inherit the Silver observation grain: "
+    "the same flight may be represented as both an arrival and a departure. "
+    "The route model has not yet been revised to count unique flights."
+)
 
-if not my_routes.empty:
-    my_routes["route"] = my_routes["departure_city"] + " → " + my_routes["arrival_city"]
+airport_routes = routes_df.loc[
+    (routes_df["departure_airport_icao"] == selected)
+    | (routes_df["arrival_airport_icao"] == selected)
+].copy()
+
+if airport_routes.empty:
+    st.info("No routes are available for this airport.")
+else:
+    destinations = set(
+        airport_routes.loc[
+            airport_routes["departure_airport_icao"] == selected,
+            "arrival_airport_icao",
+        ].dropna()
+    )
+
+    destinations.update(
+        airport_routes.loc[
+            airport_routes["arrival_airport_icao"] == selected,
+            "departure_airport_icao",
+        ].dropna()
+    )
+    destinations.discard(selected)
+
+    r1, r2 = st.columns(2)
+    r1.metric("Directed Route Pairs", len(airport_routes))
+    r2.metric("Other Airports Connected", len(destinations))
+
+    top_routes = airport_routes.sort_values(
+        "total_flights", ascending=False
+    ).head(10).copy()
+
+    top_routes["route"] = (
+        top_routes["departure_airport_icao"]
+        + " → "
+        + top_routes["arrival_airport_icao"]
+    )
 
     col_routes, col_mix = st.columns([3, 2])
 
     with col_routes:
-        routes_sorted = my_routes.sort_values("total_flights", ascending=True)
         fig_routes = px.bar(
-            routes_sorted,
+            top_routes.sort_values("total_flights"),
             x="total_flights",
             y="route",
             orientation="h",
             color="avg_duration_min",
             color_continuous_scale="Blues",
             labels={
-                "total_flights": "Total Flights",
+                "total_flights": "Observed Records",
                 "route": "",
                 "avg_duration_min": "Avg Duration (min)",
             },
             template=TEMPLATE,
         )
         fig_routes.update_layout(
-            height=400, margin=dict(t=10),
+            height=400,
+            margin=dict(t=10),
             yaxis=dict(dtick=1),
         )
         st.plotly_chart(fig_routes, use_container_width=True)
 
     with col_mix:
-        # Route type breakdown
-        my_routes["route_type"] = my_routes["avg_duration_min"].apply(
-            lambda m: "Short-haul (<2h)" if m < 120
-            else ("Medium-haul (2-6h)" if m < 360 else "Long-haul (6h+)")
-        )
-        mix = my_routes.groupby("route_type")["total_flights"].sum().reset_index()
+        valid_duration_routes = airport_routes.dropna(
+            subset=["avg_duration_min"]
+        ).copy()
 
-        fig_mix = px.pie(
-            mix,
-            values="total_flights",
-            names="route_type",
-            color="route_type",
-            color_discrete_map={
-                "Short-haul (<2h)": "#00CC96",
-                "Medium-haul (2-6h)": "#636EFA",
-                "Long-haul (6h+)": "#EF553B",
-            },
-            hole=0.4,
-            template=TEMPLATE,
-        )
-        fig_mix.update_traces(textposition="inside", textinfo="percent+label")
-        fig_mix.update_layout(
-            height=350, margin=dict(t=10, b=10),
-            showlegend=False,
-        )
-        st.plotly_chart(fig_mix, use_container_width=True)
+        def classify_duration(minutes):
+            if minutes < 120:
+                return "Under 2 hours"
+            if minutes < 360:
+                return "2 to under 6 hours"
+            return "6 hours or more"
 
-        # Connectivity summary
-        total_routes = len(routes_df[
-            (routes_df["departure_airport_icao"] == selected) |
-            (routes_df["arrival_airport_icao"] == selected)
-        ])
-        unique_destinations = len(set(
-            routes_df[routes_df["departure_airport_icao"] == selected]["arrival_airport_icao"].tolist() +
-            routes_df[routes_df["arrival_airport_icao"] == selected]["departure_airport_icao"].tolist()
-        ))
-        st.metric("Total Routes", total_routes)
-        st.metric("Unique Destinations", unique_destinations)
-
-    # Route recommendation
-    short_haul = my_routes[my_routes["route_type"] == "Short-haul (<2h)"]["total_flights"].sum()
-    long_haul = my_routes[my_routes["route_type"] == "Long-haul (6h+)"]["total_flights"].sum()
-    total_shown = my_routes["total_flights"].sum()
-
-    if total_shown > 0 and short_haul / total_shown > 0.6:
-        st.info(
-            f"**Domestic/regional hub profile:** {city_map[selected]} is dominated by short-haul "
-            f"routes ({round(short_haul/total_shown*100)}% of top route traffic). "
-            f"Opportunity: attract long-haul carriers to increase per-passenger revenue "
-            f"and airport commercial spend."
-        )
-    elif total_shown > 0 and long_haul / total_shown > 0.5:
-        st.info(
-            f"**International hub profile:** {city_map[selected]} skews long-haul "
-            f"({round(long_haul/total_shown*100)}% of top route traffic). "
-            f"Ensure premium lounge capacity and transit facilities match demand."
+        valid_duration_routes["duration_band"] = (
+            valid_duration_routes["avg_duration_min"].apply(
+                classify_duration
+            )
         )
 
-# ── Footer ────────────────────────────────────────────────────────────
+        mix = (
+            valid_duration_routes.groupby(
+                "duration_band", as_index=False
+            )["total_flights"]
+            .sum()
+        )
+
+        if not mix.empty:
+            fig_mix = px.pie(
+                mix,
+                values="total_flights",
+                names="duration_band",
+                hole=0.4,
+                template=TEMPLATE,
+                title="All Route Records by Route-Average Duration",
+            )
+            fig_mix.update_traces(
+                textposition="inside",
+                textinfo="percent+label",
+            )
+            fig_mix.update_layout(
+                height=350,
+                margin=dict(t=50, b=10),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_mix, use_container_width=True)
+
+    st.caption(
+        "Duration bands classify each route by its average duration, "
+        "not individual flights. Duration outliers are still included "
+        "in the current Gold models."
+    )
+
 st.divider()
+
 st.caption(
     "Airport Operations Intelligence | "
-    "Data: OpenSky Network API | "
-    "Pipeline: Airflow → Snowflake → dbt → Streamlit | "
-    "Note: Dubai (OMDB) traffic reduced due to regional geopolitical factors (US-Iran conflict)."
+    "Source: OpenSky Network API | "
+    "Pipeline: Airflow → PostgreSQL → dbt → Streamlit | "
+    "Dataset coverage and quality limitations apply."
 )

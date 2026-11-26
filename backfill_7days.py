@@ -1,40 +1,19 @@
-"""
-Backfill 7 Days — Standalone Script
-====================================
-Pulls the last 7 full days of flight data from the OpenSky Network API,
-loads raw data into a staging table, then builds separate Gold-layer tables
-in the BACKFILL schema.
-
-Does NOT modify any existing tables, DAGs, or dbt models.
-
-Usage (from the codespace root):
-    python backfill_7days.py
-
-Requires the same .env variables used by the pipeline:
-    OPENSKY_CLIENT_ID, OPENSKY_CLIENT_SECRET,
-    SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD,
-    SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE
-"""
-
 import os
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-
 import requests
-import snowflake.connector
+import psycopg2
+from psycopg2.extras import execute_batch
 from dotenv import load_dotenv
 
-# ── Load .env from project root ───────────────────────────────────────
 load_dotenv()
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# ── Config ─────────────────────────────────────────────────────────────
 OPENSKY_AUTH_URL = (
     "https://auth.opensky-network.org/auth/realms/opensky-network"
     "/protocol/openid-connect/token"
@@ -43,11 +22,8 @@ OPENSKY_API_BASE = "https://opensky-network.org/api"
 AIRPORTS = ["KJFK", "EGLL", "LFPG", "RJTT", "OMDB", "YSSY"]
 DAYS_TO_BACKFILL = 7
 API_PAUSE_SECONDS = 1
+BACKFILL_SCHEMA = "backfill"
 
-BACKFILL_SCHEMA = "BACKFILL"
-
-
-# ── OpenSky helpers ────────────────────────────────────────────────────
 def get_access_token():
     response = requests.post(
         OPENSKY_AUTH_URL,
@@ -62,7 +38,6 @@ def get_access_token():
     response.raise_for_status()
     logger.info("OpenSky access token obtained.")
     return response.json()["access_token"]
-
 
 def fetch_flights(token, airport, begin, end, direction):
     endpoint = f"{OPENSKY_API_BASE}/flights/{direction}"
@@ -81,33 +56,29 @@ def fetch_flights(token, airport, begin, end, direction):
         f["queried_airport"] = airport
     return flights
 
-
-# ── Snowflake helpers ──────────────────────────────────────────────────
-def get_snowflake_connection():
-    return snowflake.connector.connect(
-        account=os.environ["SNOWFLAKE_ACCOUNT"],
-        user=os.environ["SNOWFLAKE_USER"],
-        password=os.environ["SNOWFLAKE_PASSWORD"],
-        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
-        database=os.environ["SNOWFLAKE_DATABASE"],
+def get_postgres_connection():
+    return psycopg2.connect(
+        host=os.environ["POSTGRES_HOST"],
+        port=os.environ.get("POSTGRES_PORT", 5432),
+        database=os.environ["POSTGRES_DB"],
+        user=os.environ["POSTGRES_USER"],
+        password=os.environ["POSTGRES_PASSWORD"],
     )
-
 
 def unix_to_timestamp(ts):
     if ts is None:
         return None
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-
-# ── Schema & table setup ──────────────────────────────────────────────
 SETUP_SQL = f"""
 CREATE SCHEMA IF NOT EXISTS {BACKFILL_SCHEMA};
 
-CREATE OR REPLACE TABLE {BACKFILL_SCHEMA}.raw_flights (
+DROP TABLE IF EXISTS {BACKFILL_SCHEMA}.raw_flights CASCADE;
+CREATE TABLE {BACKFILL_SCHEMA}.raw_flights (
     icao24                                VARCHAR,
-    first_seen                            TIMESTAMP_NTZ,
+    first_seen                            TIMESTAMP,
     est_departure_airport                 VARCHAR,
-    last_seen                             TIMESTAMP_NTZ,
+    last_seen                             TIMESTAMP,
     est_arrival_airport                   VARCHAR,
     callsign                              VARCHAR,
     est_departure_airport_horiz_distance  INT,
@@ -118,10 +89,11 @@ CREATE OR REPLACE TABLE {BACKFILL_SCHEMA}.raw_flights (
     arrival_airport_candidates_count      INT,
     flight_direction                      VARCHAR,
     queried_airport                       VARCHAR,
-    ingested_at                           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    ingested_at                           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE OR REPLACE TABLE {BACKFILL_SCHEMA}.seed_airports (
+DROP TABLE IF EXISTS {BACKFILL_SCHEMA}.seed_airports CASCADE;
+CREATE TABLE {BACKFILL_SCHEMA}.seed_airports (
     airport_icao      VARCHAR,
     airport_name      VARCHAR,
     city              VARCHAR,
@@ -133,7 +105,8 @@ CREATE OR REPLACE TABLE {BACKFILL_SCHEMA}.seed_airports (
     is_tracked        BOOLEAN
 );
 
-CREATE OR REPLACE TABLE {BACKFILL_SCHEMA}.seed_airlines (
+DROP TABLE IF EXISTS {BACKFILL_SCHEMA}.seed_airlines CASCADE;
+CREATE TABLE {BACKFILL_SCHEMA}.seed_airlines (
     callsign_prefix  VARCHAR,
     airline_name     VARCHAR,
     airline_iata     VARCHAR,
@@ -160,7 +133,7 @@ INSERT INTO {BACKFILL_SCHEMA}.raw_flights (
 );
 """
 
-# ── Seed data ──────────────────────────────────────────────────────────
+# Seed Data originali
 AIRPORTS_SEED = [
     ("KJFK", "John F Kennedy International", "New York", "United States", 40.6413, -73.7781, "America/New_York", -5, True),
     ("EGLL", "Heathrow", "London", "United Kingdom", 51.4700, -0.4543, "Europe/London", 0, True),
@@ -329,7 +302,6 @@ AIRLINES_SEED = [
     ("VJC", "VietJet Air", "VJ", "Vietnam", "none"),
     ("VLG", "Vueling", "VY", "Spain", "none"),
     ("WZZ", "Wizz Air", "W6", "Hungary", "none"),
-    # ── Previously unmatched airlines (from data quality check) ──
     ("EDV", "Endeavor Air", "9E", "United States", "SkyTeam"),
     ("QLK", "QantasLink", "QF", "Australia", "oneworld"),
     ("SHT", "British Airways Shuttle", "BA", "United Kingdom", "oneworld"),
@@ -352,12 +324,9 @@ AIRLINES_SEED = [
     ("LHX", "Lufthansa Global Business Aviation", "LH", "Germany", "Star Alliance"),
 ]
 
-
-# ── Gold table SQL (mirrors dbt models, reads from BACKFILL schema) ──
-
+# Query Gold convertite in standard PostgreSQL (EXTRACT / ROUND / CAST)
 GOLD_DAILY_AIRPORT_TRAFFIC = f"""
 CREATE OR REPLACE TABLE {BACKFILL_SCHEMA}.gld_daily_airport_traffic AS
-
 WITH flights AS (
     SELECT
         icao24                                          AS aircraft_icao24,
@@ -366,7 +335,7 @@ WITH flights AS (
         est_arrival_airport                             AS arrival_airport_icao,
         first_seen                                      AS departed_at,
         last_seen                                       AS arrived_at,
-        TIMEDIFF('minute', first_seen, last_seen)       AS flight_duration_minutes,
+        EXTRACT(EPOCH FROM (last_seen - first_seen)) / 60 AS flight_duration_minutes,
         UPPER(LEFT(TRIM(callsign), 3))                  AS callsign_prefix,
         flight_direction,
         queried_airport,
@@ -379,11 +348,9 @@ WITH flights AS (
     WHERE (est_departure_airport IS NOT NULL OR est_arrival_airport IS NOT NULL)
       AND first_seen <= last_seen
 ),
-
 clean AS (
     SELECT * FROM flights WHERE _row_num = 1
 ),
-
 arrivals AS (
     SELECT
         arrived_at::DATE                    AS flight_date,
@@ -397,7 +364,6 @@ arrivals AS (
       AND arrival_airport_icao IS NOT NULL
     GROUP BY 1, 2
 ),
-
 departures AS (
     SELECT
         departed_at::DATE                   AS flight_date,
@@ -409,7 +375,6 @@ departures AS (
       AND departure_airport_icao IS NOT NULL
     GROUP BY 1, 2
 ),
-
 combined AS (
     SELECT
         COALESCE(a.flight_date, d.flight_date)      AS flight_date,
@@ -427,7 +392,6 @@ combined AS (
         ON a.flight_date = d.flight_date
         AND a.airport_icao = d.airport_icao
 )
-
 SELECT
     c.*,
     ap.airport_name,
@@ -440,7 +404,6 @@ LEFT JOIN {BACKFILL_SCHEMA}.seed_airports ap
 
 GOLD_ROUTE_ANALYSIS = f"""
 CREATE OR REPLACE TABLE {BACKFILL_SCHEMA}.gld_route_analysis AS
-
 WITH flights AS (
     SELECT
         icao24                                          AS aircraft_icao24,
@@ -448,7 +411,7 @@ WITH flights AS (
         est_arrival_airport                             AS arrival_airport_icao,
         first_seen                                      AS departed_at,
         last_seen                                       AS arrived_at,
-        TIMEDIFF('minute', first_seen, last_seen)       AS flight_duration_minutes,
+        EXTRACT(EPOCH FROM (last_seen - first_seen)) / 60 AS flight_duration_minutes,
         flight_direction,
         ingested_at,
         ROW_NUMBER() OVER (
@@ -459,11 +422,9 @@ WITH flights AS (
     WHERE (est_departure_airport IS NOT NULL OR est_arrival_airport IS NOT NULL)
       AND first_seen <= last_seen
 ),
-
 clean AS (
     SELECT * FROM flights WHERE _row_num = 1
 ),
-
 routes AS (
     SELECT
         departure_airport_icao,
@@ -481,7 +442,6 @@ routes AS (
       AND arrival_airport_icao IS NOT NULL
     GROUP BY 1, 2
 )
-
 SELECT
     r.*,
     dep.airport_name    AS departure_airport_name,
@@ -499,11 +459,10 @@ LEFT JOIN {BACKFILL_SCHEMA}.seed_airports arr
 
 GOLD_HOURLY_FLIGHT_ACTIVITY = f"""
 CREATE OR REPLACE TABLE {BACKFILL_SCHEMA}.gld_hourly_flight_activity AS
-
 WITH flights AS (
     SELECT
         first_seen                                      AS departed_at,
-        TIMEDIFF('minute', first_seen, last_seen)       AS flight_duration_minutes,
+        EXTRACT(EPOCH FROM (last_seen - first_seen)) / 60 AS flight_duration_minutes,
         queried_airport                                 AS airport_icao,
         flight_direction,
         ingested_at,
@@ -515,15 +474,13 @@ WITH flights AS (
     WHERE (est_departure_airport IS NOT NULL OR est_arrival_airport IS NOT NULL)
       AND first_seen <= last_seen
 ),
-
 clean AS (
     SELECT * FROM flights WHERE _row_num = 1
 ),
-
 hourly AS (
     SELECT
         departed_at::DATE                           AS flight_date,
-        HOUR(departed_at)                           AS departure_hour_utc,
+        EXTRACT(HOUR FROM departed_at)::INT         AS departure_hour_utc,
         airport_icao,
         flight_direction,
         COUNT(*)                                    AS flight_count,
@@ -531,10 +488,9 @@ hourly AS (
     FROM clean
     GROUP BY 1, 2, 3, 4
 )
-
 SELECT
     h.*,
-    MOD(h.departure_hour_utc + ap.utc_offset_hours + 24, 24)  AS departure_hour_local,
+    MOD((h.departure_hour_utc + COALESCE(ap.utc_offset_hours, 0)::INT + 24), 24) AS departure_hour_local,
     ap.airport_name,
     ap.city,
     ap.country,
@@ -546,14 +502,13 @@ LEFT JOIN {BACKFILL_SCHEMA}.seed_airports ap
 
 GOLD_AIRLINE_TRAFFIC = f"""
 CREATE OR REPLACE TABLE {BACKFILL_SCHEMA}.gld_airline_traffic AS
-
 WITH flights AS (
     SELECT
         icao24                                          AS aircraft_icao24,
         TRIM(callsign)                                  AS callsign,
         UPPER(LEFT(TRIM(callsign), 3))                  AS callsign_prefix,
         first_seen                                      AS departed_at,
-        TIMEDIFF('minute', first_seen, last_seen)       AS flight_duration_minutes,
+        EXTRACT(EPOCH FROM (last_seen - first_seen)) / 60 AS flight_duration_minutes,
         queried_airport,
         flight_direction,
         ingested_at,
@@ -565,11 +520,9 @@ WITH flights AS (
     WHERE (est_departure_airport IS NOT NULL OR est_arrival_airport IS NOT NULL)
       AND first_seen <= last_seen
 ),
-
 clean AS (
     SELECT * FROM flights WHERE _row_num = 1
 ),
-
 airline_stats AS (
     SELECT
         callsign_prefix,
@@ -578,7 +531,7 @@ airline_stats AS (
         COUNT(*)                                    AS total_flights,
         COUNT(DISTINCT aircraft_icao24)             AS unique_aircraft,
         COUNT(DISTINCT departed_at::DATE)           AS days_active,
-        ROUND(AVG(flight_duration_minutes), 1)      AS avg_duration_min,
+        ROUND(CAST(AVG(flight_duration_minutes) AS NUMERIC), 1) AS avg_duration_min,
         MIN(departed_at::DATE)                      AS first_seen_date,
         MAX(departed_at::DATE)                      AS last_seen_date
     FROM clean
@@ -586,7 +539,6 @@ airline_stats AS (
       AND callsign_prefix != ''
     GROUP BY 1, 2, 3
 )
-
 SELECT
     s.*,
     al.airline_name,
@@ -603,8 +555,6 @@ LEFT JOIN {BACKFILL_SCHEMA}.seed_airports ap
     ON s.airport_icao = ap.airport_icao;
 """
 
-
-# ── Data loading helpers ───────────────────────────────────────────────
 def load_raw_flights(conn, flights):
     if not flights:
         return 0
@@ -628,103 +578,87 @@ def load_raw_flights(conn, flights):
             "queried_airport": f.get("queried_airport"),
             "ingested_at": now,
         })
-    cursor = conn.cursor()
-    cursor.executemany(INSERT_RAW_SQL, rows)
+    with conn.cursor() as cursor:
+        execute_batch(cursor, INSERT_RAW_SQL, rows, page_size=500)
+    conn.commit()
     return len(rows)
 
-
 def load_seed_data(conn):
-    cursor = conn.cursor()
-
-    # Load airports
-    for row in AIRPORTS_SEED:
-        cursor.execute(
+    with conn.cursor() as cursor:
+        execute_batch(
+            cursor,
             f"INSERT INTO {BACKFILL_SCHEMA}.seed_airports VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            row,
+            AIRPORTS_SEED,
+            page_size=100
         )
-    logger.info("Loaded %d airports into seed_airports.", len(AIRPORTS_SEED))
+        logger.info("Loaded %d airports into seed_airports.", len(AIRPORTS_SEED))
 
-    # Load airlines
-    for row in AIRLINES_SEED:
-        cursor.execute(
+        execute_batch(
+            cursor,
             f"INSERT INTO {BACKFILL_SCHEMA}.seed_airlines VALUES (%s,%s,%s,%s,%s)",
-            row,
+            AIRLINES_SEED,
+            page_size=100
         )
-    logger.info("Loaded %d airlines into seed_airlines.", len(AIRLINES_SEED))
-
+        logger.info("Loaded %d airlines into seed_airlines.", len(AIRLINES_SEED))
+    conn.commit()
 
 def build_gold_tables(conn):
-    cursor = conn.cursor()
-    gold_tables = [
-        ("gld_daily_airport_traffic", GOLD_DAILY_AIRPORT_TRAFFIC),
-        ("gld_route_analysis", GOLD_ROUTE_ANALYSIS),
-        ("gld_hourly_flight_activity", GOLD_HOURLY_FLIGHT_ACTIVITY),
-        ("gld_airline_traffic", GOLD_AIRLINE_TRAFFIC),
-    ]
-    for name, sql in gold_tables:
-        logger.info("Building %s.%s ...", BACKFILL_SCHEMA, name)
-        cursor.execute(sql)
-        # Log row count
-        cursor.execute(f"SELECT COUNT(*) FROM {BACKFILL_SCHEMA}.{name}")
-        count = cursor.fetchone()[0]
-        logger.info("  → %d rows", count)
+    with conn.cursor() as cursor:
+        gold_tables = [
+            ("gld_daily_airport_traffic", GOLD_DAILY_AIRPORT_TRAFFIC),
+            ("gld_route_analysis", GOLD_ROUTE_ANALYSIS),
+            ("gld_hourly_flight_activity", GOLD_HOURLY_FLIGHT_ACTIVITY),
+            ("gld_airline_traffic", GOLD_AIRLINE_TRAFFIC),
+        ]
+        for name, sql in gold_tables:
+            logger.info("Building %s.%s ...", BACKFILL_SCHEMA, name)
+            cursor.execute(sql)
+            cursor.execute(f"SELECT COUNT(*) FROM {BACKFILL_SCHEMA}.{name}")
+            count = cursor.fetchone()[0]
+            logger.info("  👉 %d rows", count)
+    conn.commit()
 
-
-# ── Main ───────────────────────────────────────────────────────────────
 def main():
     token = get_access_token()
-    conn = get_snowflake_connection()
-    cursor = conn.cursor()
-
-    # Step 1: Set up schema and tables
+    conn = get_postgres_connection()
+    
     logger.info("Setting up BACKFILL schema and tables...")
-    for stmt in SETUP_SQL.split(";"):
-        stmt = stmt.strip()
-        if stmt:
-            cursor.execute(stmt)
+    with conn.cursor() as cursor:
+        cursor.execute(SETUP_SQL)
+    conn.commit()
 
-    # Step 2: Load seed data
     logger.info("Loading seed data...")
     load_seed_data(conn)
 
-    # Step 3: Fetch and load 7 days of flight data
     now_utc = datetime.now(tz=timezone.utc)
     total_loaded = 0
-
     for days_ago in range(1, DAYS_TO_BACKFILL + 1):
         day = now_utc - timedelta(days=days_ago)
         day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
         day_end = day_start + timedelta(days=1) - timedelta(seconds=1)
         begin = int(day_start.timestamp())
         end = int(day_end.timestamp())
-
         day_label = day_start.strftime("%Y-%m-%d")
-        logger.info("── Fetching %s ──", day_label)
-
+        
+        logger.info("🌐 Fetching %s 🌐", day_label)
         day_flights = []
         for airport in AIRPORTS:
             for direction in ("arrival", "departure"):
                 flights = fetch_flights(token, airport, begin, end, direction)
                 day_flights.extend(flights)
-                logger.info(
-                    "  %s %s: %d flights", airport, direction, len(flights)
-                )
+                logger.info("  %s %s: %d flights", airport, direction, len(flights))
                 time.sleep(API_PAUSE_SECONDS)
-
+                
         loaded = load_raw_flights(conn, day_flights)
         total_loaded += loaded
         logger.info("  Loaded %d flights for %s", loaded, day_label)
 
-    logger.info("━━ Raw ingestion complete: %d total flights ━━", total_loaded)
+    logger.info("🎉 Raw ingestion complete: %d total flights 🎉", total_loaded)
 
-    # Step 4: Build gold tables
     logger.info("Building Gold tables...")
     build_gold_tables(conn)
-
     conn.close()
-    logger.info("━━ Backfill complete! Tables in %s.%s ━━",
-                os.environ["SNOWFLAKE_DATABASE"], BACKFILL_SCHEMA)
-
+    logger.info("✨ Backfill complete! Tables created in PostgreSQL schema: %s ✨", BACKFILL_SCHEMA)
 
 if __name__ == "__main__":
     main()

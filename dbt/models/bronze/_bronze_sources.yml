@@ -2,10 +2,11 @@ version: 2
 
 sources:
   - name: raw
-    database: "{{ env_var('SNOWFLAKE_DATABASE') }}"
-    schema: "{{ env_var('SNOWFLAKE_SCHEMA', 'RAW') }}"
+    database: "{{ env_var('POSTGRES_DB', 'airflow') }}"
+    schema: raw
     tables:
       - name: raw_flights
+        identifier: raw_flights
         description: Raw flight data ingested from the OpenSky Network API via Airflow.
         columns:
           - name: icao24
@@ -25,4 +26,4 @@ sources:
           - name: queried_airport
             description: The airport used in the API query.
           - name: ingested_at
-            description: Timestamp when the record was loaded into Snowflake.`
+            description: Timestamp when the record was loaded into PostgreSQL.
